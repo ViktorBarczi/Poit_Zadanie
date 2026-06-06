@@ -11,7 +11,7 @@
     main { padding: 20px; display: grid; grid-template-columns: 360px 1fr; gap: 20px; }
     .card { background: #17202a; border: 1px solid #263646; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
     label { display: block; margin-top: 12px; color: #b7c3d0; }
-    input { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 5px; border-radius: 8px; border: 1px solid #34495e; background: #0d1117; color: #fff; }
+    input, select { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 5px; border-radius: 8px; border: 1px solid #34495e; background: #0d1117; color: #fff; }
     button { padding: 10px 12px; border: 0; border-radius: 8px; margin: 4px 4px 4px 0; cursor: pointer; font-weight: bold; }
     .primary { background: #2e86de; color: white; }
     .success { background: #27ae60; color: white; }
@@ -31,7 +31,7 @@
 <body>
 <header>
   <h1>IoT alarmový systém – monitorovanie vzdialenosti</h1>
-  <div class="muted">Python Flask + SQLite + CSV + ESP32-C3 + HY-SRF05</div>
+  <div class="muted">Raspberry Pi + Python Flask + SQLite + CSV + ESP32-C3 + HY-SRF05 + RGB LED + bzučiak</div>
 </header>
 
 <main>
@@ -51,7 +51,7 @@
       <h2>2. Parametre</h2>
       <label>Interval merania [ms]</label>
       <input id="interval" type="number" min="200" max="10000" value="1000">
-      <label>Prahová vzdialenosť alarmu [cm]</label>
+      <label>Prahová vzdialenosť pre alarm/reguláciu [cm]</label>
       <input id="threshold" type="number" min="2" max="400" step="0.1" value="20">
       <button class="primary" onclick="saveSettings()">Uložiť parametre</button>
     </div>
@@ -60,6 +60,28 @@
       <h2>3. Monitorovanie</h2>
       <button class="success" onclick="startMonitoring()">Start</button>
       <button class="warning" onclick="stopMonitoring()">Stop</button>
+    </div>
+
+    <div class="card">
+      <h2>Farby RGB LED</h2>
+      <label>Všeobecná farba / normálny stav</label>
+      <select id="generalColor">
+        <option value="BLUE">Modrá</option>
+        <option value="GREEN" selected>Zelená</option>
+        <option value="RED">Červená</option>
+        <option value="PURPLE">Fialová</option>
+      </select>
+
+      <label>Alarm farba</label>
+      <select id="alarmColor">
+        <option value="BLUE">Modrá</option>
+        <option value="GREEN">Zelená</option>
+        <option value="RED" selected>Červená</option>
+        <option value="PURPLE">Fialová</option>
+      </select>
+
+      <button class="primary" onclick="saveColors()">Uložiť farby do ESP32</button>
+      <p class="muted">Raspberry posiela do ESP32 príkazy G1/G2/G3/G4 a A1/A2/A3/A4.</p>
     </div>
   </section>
 
@@ -171,13 +193,40 @@ async function closeSystem() { await postJson('/api/close'); }
 async function saveSettings() { await postJson('/api/settings', settingsPayload()); }
 async function startMonitoring() { await saveSettings(); await postJson('/api/start'); }
 async function stopMonitoring() { await postJson('/api/stop'); }
+async function saveColors() {
+  await postJson('/api/settings/colors', {
+    general_color: document.getElementById('generalColor').value,
+    alarm_color: document.getElementById('alarmColor').value
+  });
+}
 
 function renderRows(data) {
   const tbody = document.getElementById('rows');
   tbody.innerHTML = '';
-  data.slice().reverse().slice(0, 20).forEach(item => {
+
+  const alarmOnlyData = data
+    .filter(item => item.alert === true || item.alert === 1)
+    .slice()
+    .reverse()
+    .slice(0, 20);
+
+  if (alarmOnlyData.length === 0) {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${item.created_at}</td><td>${item.distance_cm}</td><td>${item.threshold_cm}</td><td class="${item.alert ? 'alert' : 'ok'}">${item.alert ? 'ÁNO' : 'NIE'}</td><td>${item.led}</td><td>${item.buzzer ? 'ON' : 'OFF'}</td>`;
+    tr.innerHTML = `<td colspan="6">Zatiaľ nebol zaznamenaný žiadny alarm.</td>`;
+    tbody.appendChild(tr);
+    return;
+  }
+
+  alarmOnlyData.forEach(item => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${item.created_at}</td>
+      <td>${item.distance_cm}</td>
+      <td>${item.threshold_cm}</td>
+      <td class="alert">ÁNO</td>
+      <td>${item.led}</td>
+      <td>${item.buzzer ? 'ON' : 'OFF'}</td>
+    `;
     tbody.appendChild(tr);
   });
 }
@@ -193,7 +242,9 @@ async function refresh() {
   const latestResp = await fetch('/api/latest');
   const latest = await latestResp.json();
   const item = latest.data;
+
   document.getElementById('message').textContent = latest.state.last_message || '';
+
   if (item) {
     document.getElementById('distance').textContent = item.distance_cm + ' cm';
     document.getElementById('alarm').textContent = item.alert ? 'ALARM: objekt je bližšie ako prah' : 'Stav OK';
@@ -204,6 +255,7 @@ async function refresh() {
   } else {
     drawGauge(0, document.getElementById('threshold').value);
   }
+
   const recentResp = await fetch('/api/recent');
   const recent = await recentResp.json();
   renderRows(recent.data);
