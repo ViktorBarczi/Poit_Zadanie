@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="sk">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IoT alarmový systém</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 0; background: #101418; color: #eef2f5; }
+    header { padding: 18px 24px; background: #17202a; border-bottom: 1px solid #263646; }
+    main { padding: 20px; display: grid; grid-template-columns: 360px 1fr; gap: 20px; }
+    .card { background: #17202a; border: 1px solid #263646; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    label { display: block; margin-top: 12px; color: #b7c3d0; }
+    input { width: 100%; box-sizing: border-box; padding: 10px; margin-top: 5px; border-radius: 8px; border: 1px solid #34495e; background: #0d1117; color: #fff; }
+    button { padding: 10px 12px; border: 0; border-radius: 8px; margin: 4px 4px 4px 0; cursor: pointer; font-weight: bold; }
+    .primary { background: #2e86de; color: white; }
+    .success { background: #27ae60; color: white; }
+    .danger { background: #c0392b; color: white; }
+    .warning { background: #f39c12; color: #111; }
+    .muted { color: #9fb0c0; }
+    .value { font-size: 38px; font-weight: bold; margin: 6px 0; }
+    .alert { color: #ff7675; font-weight: bold; }
+    .ok { color: #55efc4; font-weight: bold; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<header>
+  <h1>IoT alarmový systém</h1>
+  <div class="muted">Základné webové ovládanie pre Flask server a ESP32-C3 cez USB Serial</div>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <h2>1. Spojenie</h2>
+      <label>Serial port</label>
+      <input id="port" value="/dev/ttyACM0">
+      <label>Baudrate</label>
+      <input id="baudrate" type="number" value="115200">
+      <button class="primary" onclick="openSystem()">Open</button>
+      <button class="danger" onclick="closeSystem()">Close</button>
+      <p id="message" class="muted">Systém nie je inicializovaný.</p>
+    </div>
+
+    <div class="card">
+      <h2>2. Parametre</h2>
+      <label>Interval merania [ms]</label>
+      <input id="interval" type="number" min="200" max="10000" value="1000">
+      <label>Prahová vzdialenosť alarmu [cm]</label>
+      <input id="threshold" type="number" min="2" max="400" step="0.1" value="20">
+      <button class="primary" onclick="saveSettings()">Uložiť parametre</button>
+    </div>
+
+    <div class="card">
+      <h2>3. Monitorovanie</h2>
+      <button class="success" onclick="startMonitoring()">Start</button>
+      <button class="warning" onclick="stopMonitoring()">Stop</button>
+    </div>
+  </section>
+
+  <section>
+    <div class="card">
+      <h2>Aktuálna hodnota</h2>
+      <div id="distance" class="value">-- cm</div>
+      <div id="alarm" class="muted">--</div>
+      <div class="muted">LED: <span id="led">--</span> | Buzzer: <span id="buzzer">--</span></div>
+    </div>
+  </section>
+</main>
+
+<script>
+async function postJson(url, body = {}) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  const data = await res.json();
+  document.getElementById('message').textContent = data.message || JSON.stringify(data);
+  return data;
+}
+
+function settingsPayload() {
+  return {
+    port: document.getElementById('port').value,
+    baudrate: Number(document.getElementById('baudrate').value),
+    interval_ms: Number(document.getElementById('interval').value),
+    threshold_cm: Number(document.getElementById('threshold').value)
+  };
+}
+
+async function openSystem() { await postJson('/api/open', settingsPayload()); }
+async function closeSystem() { await postJson('/api/close'); }
+async function saveSettings() { await postJson('/api/settings', settingsPayload()); }
+async function startMonitoring() { await saveSettings(); await postJson('/api/start'); }
+async function stopMonitoring() { await postJson('/api/stop'); }
+
+async function refresh() {
+  const latestResp = await fetch('/api/latest');
+  const latest = await latestResp.json();
+  const item = latest.data;
+
+  document.getElementById('message').textContent = latest.state.last_message || '';
+
+  if (item) {
+    document.getElementById('distance').textContent = item.distance_cm + ' cm';
+    document.getElementById('alarm').textContent = item.alert ? 'ALARM: objekt je blízko' : 'Stav OK';
+    document.getElementById('alarm').className = item.alert ? 'alert' : 'ok';
+    document.getElementById('led').textContent = item.led;
+    document.getElementById('buzzer').textContent = item.buzzer ? 'ON' : 'OFF';
+  }
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
