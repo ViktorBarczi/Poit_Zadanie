@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>IoT alarmový systém</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     body { font-family: Arial, sans-serif; margin: 0; background: #101418; color: #eef2f5; }
     header { padding: 18px 24px; background: #17202a; border-bottom: 1px solid #263646; }
@@ -18,15 +19,19 @@
     .warning { background: #f39c12; color: #111; }
     .muted { color: #9fb0c0; }
     .value { font-size: 38px; font-weight: bold; margin: 6px 0; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border-bottom: 1px solid #263646; padding: 8px; text-align: left; }
     .alert { color: #ff7675; font-weight: bold; }
     .ok { color: #55efc4; font-weight: bold; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    canvas { background: #0d1117; border-radius: 10px; padding: 8px; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .grid2 { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
 <header>
-  <h1>IoT alarmový systém</h1>
-  <div class="muted">Základné webové ovládanie pre Flask server a ESP32-C3 cez USB Serial</div>
+  <h1>IoT alarmový systém – monitorovanie vzdialenosti</h1>
+  <div class="muted">Python Flask + SQLite + CSV + ESP32-C3 + HY-SRF05</div>
 </header>
 
 <main>
@@ -39,7 +44,7 @@
       <input id="baudrate" type="number" value="115200">
       <button class="primary" onclick="openSystem()">Open</button>
       <button class="danger" onclick="closeSystem()">Close</button>
-      <p id="message" class="muted">Systém nie je inicializovaný.</p>
+      <p id="message" class="muted">Načítavam stav...</p>
     </div>
 
     <div class="card">
@@ -59,16 +64,88 @@
   </section>
 
   <section>
+    <div class="grid2">
+      <div class="card">
+        <h2>Aktuálna hodnota</h2>
+        <div id="distance" class="value">-- cm</div>
+        <div id="alarm" class="muted">--</div>
+        <div class="muted">LED: <span id="led">--</span> | Buzzer: <span id="buzzer">--</span></div>
+      </div>
+      <div class="card">
+        <h2>Ciferník</h2>
+        <canvas id="gauge" height="190"></canvas>
+      </div>
+    </div>
+
     <div class="card">
-      <h2>Aktuálna hodnota</h2>
-      <div id="distance" class="value">-- cm</div>
-      <div id="alarm" class="muted">--</div>
-      <div class="muted">LED: <span id="led">--</span> | Buzzer: <span id="buzzer">--</span></div>
+      <h2>Graf meranej vzdialenosti</h2>
+      <canvas id="lineChart" height="120"></canvas>
+    </div>
+
+    <div class="card">
+      <h2>Zoznam meraní</h2>
+      <table>
+        <thead>
+          <tr><th>Čas</th><th>Vzdialenosť</th><th>Prahová hodnota</th><th>Alarm</th><th>LED</th><th>Buzzer</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Archív z databázy</h2>
+      <button class="primary" onclick="loadArchive()">Načítať DB archív</button>
+      <p class="muted">CSV archív sa automaticky zapisuje do súboru <b>raspberry/data/iot_archive.csv</b>.</p>
     </div>
   </section>
 </main>
 
 <script>
+const lineCtx = document.getElementById('lineChart');
+const lineChart = new Chart(lineCtx, {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label: 'Vzdialenosť [cm]', data: [] },
+    { label: 'Prahová hodnota [cm]', data: [] }
+  ]},
+  options: { animation: false, responsive: true, scales: { y: { beginAtZero: true } } }
+});
+
+function drawGauge(value, threshold) {
+  const canvas = document.getElementById('gauge');
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const cx = w / 2;
+  const cy = h * 0.82;
+  const r = Math.min(w * 0.42, h * 0.70);
+
+  ctx.lineWidth = 18;
+  ctx.beginPath();
+  ctx.arc(cx, cy, r, Math.PI, 0);
+  ctx.strokeStyle = '#34495e';
+  ctx.stroke();
+
+  const safeValue = Math.max(0, Math.min(200, value || 0));
+  const angle = Math.PI + (safeValue / 200) * Math.PI;
+
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + Math.cos(angle) * (r - 12), cy + Math.sin(angle) * (r - 12));
+  ctx.strokeStyle = '#f1c40f';
+  ctx.stroke();
+
+  ctx.fillStyle = '#eef2f5';
+  ctx.font = '18px Arial';
+  ctx.textAlign = 'center';
+  ctx.fillText((value || 0).toFixed(1) + ' cm', cx, cy - 32);
+  ctx.font = '13px Arial';
+  ctx.fillText('0 – 200 cm, prah: ' + threshold + ' cm', cx, cy - 8);
+}
+
 async function postJson(url, body = {}) {
   const res = await fetch(url, {
     method: 'POST',
@@ -95,20 +172,49 @@ async function saveSettings() { await postJson('/api/settings', settingsPayload(
 async function startMonitoring() { await saveSettings(); await postJson('/api/start'); }
 async function stopMonitoring() { await postJson('/api/stop'); }
 
+function renderRows(data) {
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '';
+  data.slice().reverse().slice(0, 20).forEach(item => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${item.created_at}</td><td>${item.distance_cm}</td><td>${item.threshold_cm}</td><td class="${item.alert ? 'alert' : 'ok'}">${item.alert ? 'ÁNO' : 'NIE'}</td><td>${item.led}</td><td>${item.buzzer ? 'ON' : 'OFF'}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderChart(data) {
+  lineChart.data.labels = data.map(x => x.created_at.split('T').pop());
+  lineChart.data.datasets[0].data = data.map(x => x.distance_cm < 0 ? null : x.distance_cm);
+  lineChart.data.datasets[1].data = data.map(x => x.threshold_cm);
+  lineChart.update();
+}
+
 async function refresh() {
   const latestResp = await fetch('/api/latest');
   const latest = await latestResp.json();
   const item = latest.data;
-
   document.getElementById('message').textContent = latest.state.last_message || '';
-
   if (item) {
     document.getElementById('distance').textContent = item.distance_cm + ' cm';
-    document.getElementById('alarm').textContent = item.alert ? 'ALARM: objekt je blízko' : 'Stav OK';
+    document.getElementById('alarm').textContent = item.alert ? 'ALARM: objekt je bližšie ako prah' : 'Stav OK';
     document.getElementById('alarm').className = item.alert ? 'alert' : 'ok';
     document.getElementById('led').textContent = item.led;
     document.getElementById('buzzer').textContent = item.buzzer ? 'ON' : 'OFF';
+    drawGauge(item.distance_cm, item.threshold_cm);
+  } else {
+    drawGauge(0, document.getElementById('threshold').value);
   }
+  const recentResp = await fetch('/api/recent');
+  const recent = await recentResp.json();
+  renderRows(recent.data);
+  renderChart(recent.data);
+}
+
+async function loadArchive() {
+  const resp = await fetch('/api/archive/db?limit=100');
+  const archive = await resp.json();
+  renderRows(archive.data);
+  renderChart(archive.data);
 }
 
 refresh();
