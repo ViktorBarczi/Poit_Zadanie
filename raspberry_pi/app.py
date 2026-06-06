@@ -1,12 +1,21 @@
+import csv
 import os
+import sqlite3
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import serial
 from flask import Flask, jsonify, render_template, request
 
 APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+DB_PATH = DATA_DIR / "iot_archive.sqlite3"
+CSV_PATH = DATA_DIR / "iot_archive.csv"
+
 DEFAULT_SERIAL_PORT = os.environ.get("SERIAL_PORT", "/dev/ttyACM0")
 DEFAULT_BAUDRATE = int(os.environ.get("SERIAL_BAUDRATE", "115200"))
 
@@ -35,13 +44,83 @@ recent_data = []
 MAX_RECENT = 100
 
 
-def serial_write(command):
-    global ser
-    with serial_lock:
-        if ser is None or not ser.is_open:
-            raise RuntimeError("Serial port nie je otvorený. Najprv klikni Open.")
-        ser.write((command + "\n").encode("utf-8"))
-        ser.flush()
+def db_connect():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_storage():
+    with db_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS measurements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                distance_cm REAL,
+                threshold_cm REAL,
+                alert INTEGER,
+                buzzer INTEGER,
+                interval_ms INTEGER,
+                hw_state TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                interval_ms INTEGER,
+                threshold_cm REAL
+            )
+            """
+        )
+
+    if not CSV_PATH.exists():
+        with CSV_PATH.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["created_at", "distance_cm", "threshold_cm", "alert", "buzzer", "interval_ms", "hw_state"])
+
+
+def log_event(event_type, message):
+    created_at = datetime.now().isoformat(timespec="seconds")
+    with state_lock:
+        interval_ms = state["interval_ms"]
+        threshold_cm = state["threshold_cm"]
+        state["last_message"] = message
+
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO events(created_at, event_type, message, interval_ms, threshold_cm) VALUES (?, ?, ?, ?, ?)",
+            (created_at, event_type, message, interval_ms, threshold_cm),
+        )
+
+
+def save_measurement(item):
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO measurements(created_at, distance_cm, threshold_cm, alert, buzzer, interval_ms, hw_state)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item["created_at"],
+                item["distance_cm"],
+                item["threshold_cm"],
+                item["alert"],
+                item["buzzer"],
+                item["interval_ms"],
+                item["hw_state"],
+            ),
+        )
+
+    with CSV_PATH.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            item["created_at"], item["distance_cm"], item["threshold_cm"],
+            item["alert"], item["buzzer"], item["interval_ms"], item["hw_state"]
+        ])
 
 
 def parse_data_line(line):
@@ -56,13 +135,25 @@ def parse_data_line(line):
     with state_lock:
         interval_ms = state["interval_ms"]
 
+    alert = int(parts[2])
     return {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
         "distance_cm": float(parts[0]),
         "threshold_cm": float(parts[1]),
-        "alert": int(parts[2]),
-        "hw_state": parts[3],
+        "alert": alert,
+        "buzzer": 1 if alert else 0,
         "interval_ms": interval_ms,
+        "hw_state": parts[3],
     }
+
+
+def serial_write(command):
+    global ser
+    with serial_lock:
+        if ser is None or not ser.is_open:
+            raise RuntimeError("Serial port nie je otvorený. Najprv klikni Open.")
+        ser.write((command + "\n").encode("utf-8"))
+        ser.flush()
 
 
 def reader_loop():
@@ -71,7 +162,6 @@ def reader_loop():
         try:
             with serial_lock:
                 current_ser = ser
-
             if current_ser is None or not current_ser.is_open:
                 time.sleep(0.2)
                 continue
@@ -83,6 +173,7 @@ def reader_loop():
             if raw.startswith("DATA:"):
                 item = parse_data_line(raw)
                 if item:
+                    save_measurement(item)
                     with state_lock:
                         state["last_data"] = item
                         recent_data.append(item)
@@ -133,6 +224,7 @@ def api_open():
 
         start_reader_thread()
         serial_write("O")
+        log_event("OPEN", f"Spojenie otvorené na porte {port}.")
         return jsonify(ok=True, message="Systém inicializovaný.")
     except Exception as exc:
         with state_lock:
@@ -158,6 +250,7 @@ def api_settings():
         serial_write(f"I{interval_ms}")
         serial_write(f"D{threshold_cm}")
 
+    log_event("SETTINGS", f"Nastavené parametre: interval {interval_ms} ms, prah {threshold_cm:.1f} cm.")
     return jsonify(ok=True, interval_ms=interval_ms, threshold_cm=threshold_cm)
 
 
@@ -169,6 +262,7 @@ def api_start():
         serial_write("S")
         with state_lock:
             state["monitoring"] = True
+        log_event("START", "Monitorovanie spustené.")
         return jsonify(ok=True, message="Monitorovanie spustené.")
     except Exception as exc:
         return jsonify(ok=False, message=str(exc)), 500
@@ -180,6 +274,7 @@ def api_stop():
         serial_write("T")
         with state_lock:
             state["monitoring"] = False
+        log_event("STOP", "Monitorovanie zastavené.")
         return jsonify(ok=True, message="Monitorovanie zastavené.")
     except Exception as exc:
         return jsonify(ok=False, message=str(exc)), 500
@@ -198,6 +293,7 @@ def api_close():
         with state_lock:
             state["opened"] = False
             state["monitoring"] = False
+        log_event("CLOSE", "Spojenie ukončené.")
         return jsonify(ok=True, message="Systém ukončený.")
     except Exception as exc:
         return jsonify(ok=False, message=str(exc)), 500
@@ -221,5 +317,24 @@ def api_recent():
         return jsonify(data=list(recent_data))
 
 
+@app.route("/api/archive/db")
+def api_archive_db():
+    limit = int(request.args.get("limit", 200))
+    limit = max(1, min(1000, limit))
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM measurements ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    return jsonify(data=[dict(row) for row in rows][::-1])
+
+
+@app.route("/api/archive/events")
+def api_archive_events():
+    with db_connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100").fetchall()
+    return jsonify(data=[dict(row) for row in rows])
+
+
 if __name__ == "__main__":
+    init_storage()
     app.run(host="0.0.0.0", port=5000, debug=False)
